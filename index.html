@@ -4,20 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>Meshtastic GPS Tracker</title>
-
-  <!-- PWA Meta Tags -->
-  <meta name="mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black">
-  <meta name="apple-mobile-web-app-title" content="MeshTracker">
-  <meta name="theme-color" content="#000000">
-
-  <!-- Inline Manifest (single-file PWA) -->
-  <link rel="manifest" href="/manifest.json">
-  <link rel="apple-touch-icon" href="data:image/svg+xml,&lt;svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'&gt;&lt;circle cx='50' cy='50' r='40' fill='%23007aff' /&gt;&lt;text x='50' y='55' font-size='40' text-anchor='middle' fill='white'&gt;M&lt;/text&gt;&lt;/svg&gt;">
-
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="anonymous"/>
-
   <style>
     body, html { margin:0; padding:0; height:100%; font-family:Arial, sans-serif; overflow:hidden; }
     #app { display:flex; flex-direction:column; height:100%; }
@@ -64,6 +51,7 @@
       <button id="btn-send" onclick="manualSendPosition()">Send Position</button>
       <button id="btn-track" onclick="toggleTracking()">Start Tracking</button>
       <button onclick="showConfig()">Settings</button>
+      <button onclick="sendFakePosition()">Send Fake Pos (MQTT)</button>
     </div>
   </div>
 
@@ -192,7 +180,7 @@ message ServiceEnvelope {
         const bin = atob(b64.replace(/-/g,'+').replace(/_/g,'/'));
         return Uint8Array.from(bin, c => c.charCodeAt(0));
       } catch (e) {
-        log("Invalid base64 PSK");
+        log("Invalid base64 PSK:", e);
         return null;
       }
     }
@@ -300,6 +288,26 @@ message ServiceEnvelope {
 
     function updateMyMarker(lat, lon) {
       updateMarker(myNodeIdHex, lat, lon, config.name || 'WebTracker', true);
+    }
+
+    async function sendFakePosition() {
+      if (!client?.connected) {
+        showStatus("Not connected to MQTT", 5000);
+        return;
+      }
+
+      // Port Saint John, FL center
+      const centerLat = 28.554;
+      const centerLon = -80.808;
+
+      // Random offset within ~3 km (approx 0.027 degrees)
+      const offset = 0.027;
+      const fakeLat = centerLat + (Math.random() * offset * 2 - offset);
+      const fakeLon = centerLon + (Math.random() * offset * 2 - offset);
+      const fakeAlt = 5;
+
+      await sendPosition(fakeLat, fakeLon, fakeAlt);
+      showStatus("Random fake position sent (near Port Saint John, FL)");
     }
 
     async function manualSendPosition() {
@@ -429,6 +437,7 @@ message ServiceEnvelope {
             const pos = Position.decode(payloadBytes);
             if (verbose) {
               console.log("Raw Position fields:", JSON.stringify(pos));
+              console.log("Decoded Position object keys:", Object.keys(pos));
               console.log("latitudeI present?", 'latitudeI' in pos, "value:", pos.latitudeI);
               console.log("longitudeI present?", 'longitudeI' in pos, "value:", pos.longitudeI);
             }
@@ -529,40 +538,6 @@ message ServiceEnvelope {
       });
     }
 
-    // Inline Service Worker for single-file PWA
-    if ('serviceWorker' in navigator) {
-      const swCode = `
-        self.addEventListener('install', e => {
-          e.waitUntil(
-            caches.open('mesh-tracker-v1').then(cache => {
-              return cache.addAll(['./']);
-            })
-          );
-        });
-
-        self.addEventListener('fetch', e => {
-          e.respondWith(
-            caches.match(e.request).then(response => {
-              return response || fetch(e.request);
-            })
-          );
-        });
-      `;
-
-      const blob = new Blob([swCode], {type: 'application/javascript'});
-      const swUrl = URL.createObjectURL(blob);
-
-      window.addEventListener('load', () => {
-        navigator.serviceWorker.register(swUrl, {scope: './'})
-          .then(reg => {
-            if (verbose) log('Service Worker registered');
-          })
-          .catch(err => {
-            if (verbose) log('Service Worker failed:', err);
-          });
-      });
-    }
-
     initMap();
     loadConfigUI();
     if (Object.keys(config).length > 0) {
@@ -574,4 +549,3 @@ message ServiceEnvelope {
   </script>
 </body>
 </html>
-
