@@ -20,6 +20,34 @@
     #bottom-bar button { padding:8px 12px; background:#444; color:white; border:none; border-radius:6px; font-size:13px; cursor:pointer; min-width:90px; margin:4px; }
     #bottom-bar button.active { background:#007aff; }
     #status { position:fixed; top:0; left:0; right:0; background:rgba(0,0,0,0.75); color:#fff; padding:10px; text-align:center; z-index:1000; display:none; font-size:14px; }
+
+    /* Messages Modal */
+    #modal-messages {
+      position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:2000; display:none; flex-direction:column; color:#fff;
+    }
+    #modal-messages.show { display:flex; }
+    #modal-header {
+      background:#1e1e1e; padding:12px 16px; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #333;
+    }
+    #modal-header h2 { margin:0; font-size:1.2rem; }
+    #close-modal { background:none; border:none; color:#fff; font-size:1.8rem; cursor:pointer; padding:0 8px; }
+    #channel-select-container { display:flex; align-items:center; gap:10px; }
+    #channel-select { padding:8px 12px; font-size:1rem; background:#333; color:#fff; border:1px solid #555; border-radius:6px; }
+    #chat-container {
+      flex:1; overflow-y:auto; padding:16px; background:#111; display:flex; flex-direction:column; gap:12px;
+    }
+    .chat-msg {
+      max-width:80%; padding:10px 14px; border-radius:18px; font-size:0.95rem; line-height:1.4; word-break:break-word;
+    }
+    .chat-msg.sent { background:#007aff; color:white; align-self:flex-end; }
+    .chat-msg.received { background:#333; color:#fff; align-self:flex-start; }
+    .chat-meta { font-size:0.75rem; color:#aaa; margin-top:4px; opacity:0.8; }
+    #chat-input-area {
+      padding:12px 16px; background:#1e1e1e; border-top:1px solid #333; display:flex; gap:10px;
+    }
+    #chat-input { flex:1; padding:12px; border:1px solid #555; border-radius:8px; background:#222; color:#fff; font-size:1rem; outline:none; }
+    #chat-send { padding:12px 20px; background:#007aff; color:white; border:none; border-radius:8px; cursor:pointer; font-weight:bold; }
+
     #config { 
       position:fixed; inset:0; background:#1e1e1e; color:#e0e0e0; padding:20px; overflow-y:auto; z-index:1001; display:none; 
     }
@@ -43,24 +71,42 @@
     <div id="status"></div>
     <div id="map"></div>
     <div id="messages"></div>
-    <div id="input-area">
-      <input id="msg-input" placeholder="Type message to channel..." />
-      <button onclick="sendText()">Send</button>
+
+    <!-- Messages Modal -->
+    <div id="modal-messages">
+      <div id="modal-header">
+        <div id="channel-select-container">
+          <label for="channel-select">Channel:</label>
+          <select id="channel-select">
+            <option value="LongFast">LongFast</option>
+            <!-- Add more channels here later if needed -->
+          </select>
+        </div>
+        <h2>Channel Chat</h2>
+        <button id="close-modal">×</button>
+      </div>
+      <div id="chat-container"></div>
+      <div id="chat-input-area">
+        <input id="chat-input" placeholder="Type your message..." autocomplete="off" />
+        <button id="chat-send">Send</button>
+      </div>
     </div>
+
     <div id="bottom-bar">
       <button id="btn-send" onclick="manualSendPosition()">Send Position</button>
       <button id="btn-track" onclick="toggleTracking()">Start Tracking</button>
+      <button onclick="showMessagesModal()">Messages</button>
       <button onclick="showConfig()">Settings</button>
-      <button onclick="sendFakePosition()">Send Fake Pos (MQTT)</button>
+      <button onclick="sendFakePosition()">Send Fake Pos</button>
     </div>
   </div>
 
   <div id="config">
     <h2>Meshtastic Tracker Config</h2>
     <label>MQTT Broker (ws:// or wss://host:port)</label>
-    <input id="mqtt-server" value="ws://mqtt.kc3efj.net:9001" />
+    <input id="mqtt-server" value="wss://mqtt.kc3efj.net:9001" />
     <label>Username (optional)</label>
-    <input id="mqtt-user" />
+    <input id="mqtt-user" value="scmesh" />
     <label>Password (optional)</label>
     <input id="mqtt-pass" type="password" />
     <label>Root Topic</label>
@@ -119,6 +165,7 @@ message User {
   string short_name = 3;
   uint32 hw_model = 4;
   bytes public_key = 5;
+  string macaddr = 6;
 }
 
 message Data {
@@ -149,17 +196,17 @@ message ServiceEnvelope {
     const MeshPacket = root.lookupType("meshtastic.MeshPacket");
     const ServiceEnvelope = root.lookupType("meshtastic.ServiceEnvelope");
 
-    let map, myMarker, markers = {}, client, watchId = null, intervalId = null, isTracking = false;
+    let map, myMarker, markers = {}, client, watchId = null, isTracking = false;
     let config = JSON.parse(localStorage.getItem('meshConfig')) || {};
     let myNodeId = parseInt(localStorage.getItem('myNodeId') || Math.floor(Math.random() * 0xffffffff));
     let myNodeIdHex = '!' + myNodeId.toString(16).padStart(8, '0');
 
     const statusEl = document.getElementById('status');
-    const messagesDiv = document.getElementById('messages');
     const btnTrack = document.getElementById('btn-track');
-
-    // Verbose is on by default now
     let verbose = true;
+
+    // Channel messages storage: { channelName: [ {nodeId, text, time, isSent} ] }
+    let channelMessages = { LongFast: [] };
 
     function log(...args) {
       if (verbose) console.log('[MeshTracker]', ...args);
@@ -185,7 +232,14 @@ message ServiceEnvelope {
       if (!b64) return null;
       try {
         const bin = atob(b64.replace(/-/g,'+').replace(/_/g,'/'));
-        return Uint8Array.from(bin, c => c.charCodeAt(0));
+        let arr = Uint8Array.from(bin, c => c.charCodeAt(0));
+        if (arr.length !== 32) {
+          log(`PSK length ${arr.length} != 32 - padding with zeros for test`);
+          const padded = new Uint8Array(32);
+          arr.copyWithin(padded, 0, Math.min(arr.length, 32));
+          arr = padded;
+        }
+        return arr;
       } catch (e) {
         log("Invalid base64 PSK:", e);
         return null;
@@ -219,8 +273,8 @@ message ServiceEnvelope {
     function hideConfig() { document.getElementById('config').classList.remove('show'); }
 
     function loadConfigUI() {
-      document.getElementById('mqtt-server').value = config.server || 'ws://mqtt.kc3efj.net:9001';
-      document.getElementById('mqtt-user').value = config.user || '';
+      document.getElementById('mqtt-server').value = config.server || 'wss://mqtt.kc3efj.net:9001';
+      document.getElementById('mqtt-user').value = config.user || 'scmesh';
       document.getElementById('mqtt-pass').value = config.pass || '';
       document.getElementById('root-topic').value = config.root || 'msh/US/FL';
       document.getElementById('channel-name').value = config.channelName || 'LongFast';
@@ -229,8 +283,8 @@ message ServiceEnvelope {
       document.getElementById('precision').value = config.precision ?? 6;
       document.getElementById('interval').value = config.interval ?? 600;
       document.getElementById('use-json').value = config.useJson !== false ? 'true' : 'false';
-      document.getElementById('verbose-logging').checked = config.verboseLogging !== false; // default true
-      verbose = document.getElementById('verbose-logging').checked;
+      document.getElementById('verbose-logging').checked = true;
+      verbose = true;
       updatePrecisionLabel(document.getElementById('precision').value);
     }
 
@@ -246,9 +300,9 @@ message ServiceEnvelope {
         precision: parseInt(document.getElementById('precision').value),
         interval: parseInt(document.getElementById('interval').value),
         useJson: document.getElementById('use-json').value === 'true',
-        verboseLogging: document.getElementById('verbose-logging').checked
+        verboseLogging: true
       };
-      verbose = config.verboseLogging;
+      verbose = true;
       localStorage.setItem('meshConfig', JSON.stringify(config));
       localStorage.setItem('myNodeId', myNodeId);
       hideConfig();
@@ -256,48 +310,112 @@ message ServiceEnvelope {
     }
 
     function showMap() {
-      document.getElementById('map').style.display = 'block';
-      document.getElementById('messages').style.display = 'none';
-      document.getElementById('input-area').style.display = 'none';
+      const mapEl = document.getElementById('map');
+      if (!mapEl) {
+        console.error("Map element not found!");
+        showStatus("Error: Map container missing", 8000);
+        return;
+      }
+      mapEl.style.display = 'block';
+      const messagesEl = document.getElementById('messages');
+      if (messagesEl) messagesEl.style.display = 'none';
+      const inputAreaEl = document.getElementById('input-area');
+      if (inputAreaEl) inputAreaEl.style.display = 'none';
       if (map) map.invalidateSize();
     }
 
-    function showMessages() {
-      document.getElementById('map').style.display = 'none';
-      document.getElementById('messages').style.display = 'block';
-      document.getElementById('input-area').style.display = 'flex';
+    function showMessagesModal() {
+      document.getElementById('modal-messages').classList.add('show');
+      renderChatMessages(document.getElementById('channel-select').value);
+      document.getElementById('chat-container').scrollTop = document.getElementById('chat-container').scrollHeight;
     }
 
-    function initMap() {
-      map = L.map('map').setView([28.38, -80.60], 13);
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-      }).addTo(map);
-      myMarker = L.circleMarker([28.38, -80.60], {color: 'blue', radius: 10, fillOpacity: 0.7})
-        .addTo(map).bindPopup("You (last known)");
+    function hideMessagesModal() {
+      document.getElementById('modal-messages').classList.remove('show');
     }
 
-    function updateMarker(nodeIdHex, lat, lon, extra = '', isMe = false) {
-      let marker = markers[nodeIdHex];
-      if (!marker) {
-        marker = L.circleMarker([lat, lon], {
-          color: isMe ? 'blue' : 'gray',
-          radius: isMe ? 12 : 8,
-          fillOpacity: 0.8
-        }).addTo(map);
-        markers[nodeIdHex] = marker;
+    function renderChatMessages(channel) {
+      const container = document.getElementById('chat-container');
+      container.innerHTML = '';
+      const msgs = channelMessages[channel] || [];
+      msgs.forEach(msg => {
+        const div = document.createElement('div');
+        div.className = `chat-msg ${msg.isSent ? 'sent' : 'received'}`;
+        div.innerHTML = `
+          <strong>${msg.isSent ? 'You' : msg.nodeId}</strong><br>
+          ${msg.text.replace(/</g, '&lt;')}
+          <div class="chat-meta">${new Date(msg.time).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</div>
+        `;
+        container.appendChild(div);
+      });
+      container.scrollTop = container.scrollHeight;
+    }
+
+    function addChatMessage(channel, fromHex, text, isSent = false) {
+      if (!channelMessages[channel]) channelMessages[channel] = [];
+      channelMessages[channel].push({
+        nodeId: fromHex,
+        text,
+        time: Date.now(),
+        isSent
+      });
+      if (document.getElementById('modal-messages').classList.contains('show') &&
+          document.getElementById('channel-select').value === channel) {
+        renderChatMessages(channel);
       }
-      marker.setLatLng([lat, lon]);
-      marker.bindPopup(
-        `${nodeIdHex}<br>${extra || 'Unknown'}<br>${lat.toFixed(6)}, ${lon.toFixed(6)}${isMe ? ' (You)' : ''}`
-      );
-      if (isMe) {
-        map.panTo([lat, lon], {animate: true});
-      }
     }
 
-    function updateMyMarker(lat, lon) {
-      updateMarker(myNodeIdHex, lat, lon, config.name || 'WebTracker', true);
+    async function sendText() {
+      const input = document.getElementById('chat-input');
+      const text = input.value.trim();
+      if (!text || !client?.connected) return;
+
+      const channel = document.getElementById('channel-select').value;
+      const payload = new TextEncoder().encode(text);
+
+      await sendProtobuf(payload, 1, channel);  // port 1 = TEXT_MESSAGE_APP
+
+      addChatMessage(channel, myNodeIdHex, text, true);
+      input.value = '';
+    }
+
+    document.getElementById('chat-send').onclick = sendText;
+    document.getElementById('chat-input').addEventListener('keypress', e => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        sendText();
+      }
+    });
+
+    document.getElementById('close-modal').onclick = hideMessagesModal;
+
+    document.getElementById('channel-select').onchange = () => {
+      renderChatMessages(document.getElementById('channel-select').value);
+    };
+
+    async function sendPosition(lat, lon, alt = 0) {
+      if (!client?.connected) return showStatus("Not connected", 5000);
+
+      const latI = Math.round(lat * 1e7) | 0;
+      const lonI = Math.round(lon * 1e7) | 0;
+
+      const pos = Position.create({
+        latitudeI: latI,
+        longitudeI: lonI,
+        altitude: Math.round(alt),
+        time: Math.floor(Date.now() / 1000),
+        precision_bits: config.precision ?? 6
+      });
+
+      const payload = Position.encode(pos).finish();
+
+      if (verbose) {
+        log("Sending Position - latI:", latI, "lonI:", lonI, "alt:", alt);
+        log("Position payload hex:", bytesToHex(payload));
+      }
+
+      await sendProtobuf(payload, 3);
+      showStatus("Position sent");
     }
 
     async function sendFakePosition() {
@@ -355,42 +473,7 @@ message ServiceEnvelope {
       showStatus("Tracking stopped");
     }
 
-    async function sendPosition(lat, lon, alt = 0) {
-      if (!client?.connected) return showStatus("Not connected", 5000);
-
-      const latI = Math.round(lat * 1e7) | 0;
-      const lonI = Math.round(lon * 1e7) | 0;
-
-      const pos = Position.create({
-        latitudeI: latI,
-        longitudeI: lonI,
-        altitude: Math.round(alt),
-        time: Math.floor(Date.now() / 1000),
-        precision_bits: config.precision ?? 6
-      });
-
-      const payload = Position.encode(pos).finish();
-
-      if (verbose) {
-        log("Sending Position - latI:", latI, "lonI:", lonI, "alt:", alt);
-        log("Position payload hex:", bytesToHex(payload));
-      }
-
-      await sendProtobuf(payload, 3);
-      showStatus("Position sent");
-    }
-
-    async function sendText() {
-      const input = document.getElementById('msg-input');
-      const text = input.value.trim();
-      if (!text || !client?.connected) return;
-      const payload = new TextEncoder().encode(text);
-      await sendProtobuf(payload, 1);
-      addMessage('You', text, true);
-      input.value = '';
-    }
-
-    async function sendProtobuf(payloadBytes, portNum) {
+    async function sendProtobuf(payloadBytes, portNum, targetChannel = config.channelName) {
       const data = Data.create({portnum: portNum, payload: payloadBytes});
       const packet = MeshPacket.create({
         from: myNodeId,
@@ -403,8 +486,8 @@ message ServiceEnvelope {
 
       const finalBytes = MeshPacket.encode(packet).finish();
 
-      const channelPath = config.useJson ? 'json' : '2/e';
-      const topic = `${config.root}/${channelPath}/${config.channelName}/${myNodeIdHex}`;
+      const channelPath = config.useJson ? 'json/mqtt' : '2/e/mqtt';
+      const topic = `${config.root}/${channelPath}/${targetChannel}/${myNodeIdHex}`;
 
       client.publish(topic, finalBytes, {qos: 0}, (err) => {
         if (err) log("Publish failed:", err);
@@ -412,12 +495,42 @@ message ServiceEnvelope {
       });
     }
 
-    function addMessage(from, text, isSent = false) {
-      const div = document.createElement('div');
-      div.className = `msg ${isSent ? 'sent' : 'received'}`;
-      div.innerHTML = `<strong>${from}</strong><br>${text.replace(/</g,'&lt;')}`;
-      messagesDiv.appendChild(div);
-      messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    function updateMarker(nodeIdHex, lat, lon, extra = '', isMe = false) {
+      let marker = markers[nodeIdHex];
+      if (!marker) {
+        marker = L.circleMarker([lat, lon], {
+          color: isMe ? 'blue' : 'gray',
+          radius: isMe ? 12 : 8,
+          fillOpacity: 0.8
+        }).addTo(map);
+        markers[nodeIdHex] = marker;
+      }
+      marker.setLatLng([lat, lon]);
+      marker.bindPopup(
+        `${nodeIdHex}<br>${extra || 'Unknown'}<br>${lat.toFixed(6)}, ${lon.toFixed(6)}${isMe ? ' (You)' : ''}`
+      );
+      if (isMe) {
+        map.panTo([lat, lon], {animate: true});
+      }
+    }
+
+    function updateMyMarker(lat, lon) {
+      updateMarker(myNodeIdHex, lat, lon, config.name || 'WebTracker', true);
+    }
+
+    function initMap() {
+      const mapEl = document.getElementById('map');
+      if (!mapEl) {
+        console.error("Map element not found!");
+        showStatus("Error: Map container missing", 8000);
+        return;
+      }
+      map = L.map('map').setView([28.38, -80.60], 13);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+      }).addTo(map);
+      myMarker = L.circleMarker([28.38, -80.60], {color: 'blue', radius: 10, fillOpacity: 0.7})
+        .addTo(map).bindPopup("You (last known)");
     }
 
     async function processPacket(packet, topic) {
@@ -431,15 +544,12 @@ message ServiceEnvelope {
         if (packet.encrypted && packet.encrypted.length > 0) {
           log(`Encrypted payload detected (${packet.encrypted.length} bytes)`);
           const pskB = base64ToBytes(config.psk);
-          if (!pskB || pskB.length !== 32) {
-            log("Skipping - invalid PSK length");
+          if (!pskB) {
+            log("Skipping - no valid PSK");
             return;
           }
           payloadBytes = await decryptPayload(packet.encrypted, pskB, packet.from, packet.id);
-          if (!payloadBytes) {
-            log("Decryption failed or returned null");
-            return;
-          }
+          if (!payloadBytes) return;
           log(`Decrypted successfully - payload length: ${payloadBytes.length} bytes`);
           log(`Decrypted hex: ${bytesToHex(payloadBytes)}`);
         } else if (packet.decoded && packet.decoded.payload) {
@@ -453,6 +563,8 @@ message ServiceEnvelope {
 
         const port = packet.decoded?.portnum || 0;
         log(`PortNum: ${port}`);
+
+        let channel = topic.split('/')[3] || config.channelName;
 
         if (port === 3) {
           try {
@@ -483,8 +595,8 @@ message ServiceEnvelope {
         } else if (port === 1) {
           try {
             const text = new TextDecoder().decode(payloadBytes);
-            log(`Text message: "${text}"`);
-            addMessage(fromHex, text);
+            log(`Text message: "${text}" from ${fromHex}`);
+            addChatMessage(channel, fromHex, text, false);
           } catch (e) {
             log("Text decode failed");
           }
@@ -494,7 +606,7 @@ message ServiceEnvelope {
             log(`NodeInfo - long_name: ${user.long_name || 'N/A'}, short_name: ${user.short_name || 'N/A'}`);
             if (markers[fromHex]) markers[fromHex].bindPopup(user.long_name || fromHex);
           } catch (e) {
-            log("NodeInfo decode failed");
+            log("NodeInfo decode failed:", e.message);
           }
         } else {
           log(`Unhandled PortNum ${port} - ${payloadBytes.length} bytes`);
@@ -534,30 +646,62 @@ message ServiceEnvelope {
 
       client.on('message', async (topic, message) => {
         try {
-          if (config.useJson) {
-            log("JSON mode - raw message:", message.toString());
-            // Add JSON parsing here later if needed
-          } else {
-            const rawBytes = new Uint8Array(message);
-            log(`Raw message length: ${rawBytes.length} bytes`);
-            log(`Raw hex (first 64 bytes): ${bytesToHex(rawBytes.slice(0, 64))}${rawBytes.length > 64 ? '...' : ''}`);
+          const rawBytes = new Uint8Array(message);
+          log(`Raw message length: ${rawBytes.length} bytes`);
+          log(`Raw hex (first 64 bytes): ${bytesToHex(rawBytes.slice(0, 64))}${rawBytes.length > 64 ? '...' : ''}`);
 
-            let packet;
+          if (rawBytes[0] === 0x7b) {  // JSON detection
+            const jsonStr = new TextDecoder().decode(rawBytes);
+            log("Detected JSON payload:", jsonStr.substring(0, 500) + (jsonStr.length > 500 ? '...' : ''));
             try {
-              packet = MeshPacket.decode(rawBytes);
-              log("Decoded directly as MeshPacket");
-            } catch (e) {
-              try {
-                const env = ServiceEnvelope.decode(rawBytes);
-                packet = env.packet;
-                log("Decoded as ServiceEnvelope → packet extracted");
-              } catch (e2) {
-                log("Failed to decode as MeshPacket or ServiceEnvelope");
-                return;
+              const json = JSON.parse(jsonStr);
+              log("Parsed JSON:", JSON.stringify(json, null, 2));
+
+              const from = json.from || json.sender || 0;
+              const fromHex = '!' + (from >>> 0).toString(16).padStart(8, '0');
+
+              let lat = 0, lon = 0, alt = 0;
+              if (json.payload) {
+                lat = (json.payload.latitude_i || json.payload.latitude || 0) / 1e7;
+                lon = (json.payload.longitude_i || json.payload.longitude || 0) / 1e7;
+                alt = json.payload.altitude || json.payload.alt || 0;
+              } else if (json.latitude_i !== undefined) {
+                lat = (json.latitude_i || 0) / 1e7;
+                lon = (json.longitude_i || 0) / 1e7;
+                alt = json.altitude || 0;
               }
+
+              if (lat !== 0 && lon !== 0 && !isNaN(lat) && !isNaN(lon)) {
+                log(`JSON Position from ${fromHex}: lat=${lat.toFixed(6)}, lon=${lon.toFixed(6)}, alt=${alt}`);
+                updateMarker(fromHex, lat, lon, `Alt: ${alt}m (JSON from ${json.type || 'unknown'})`, fromHex === myNodeIdHex);
+              } else if (json.type === 'text' && json.payload?.text) {
+                log(`JSON Text from ${fromHex}: "${json.payload.text}"`);
+                const channel = topic.split('/')[3] || 'LongFast';
+                addChatMessage(channel, fromHex, json.payload.text, false);
+              } else {
+                log("JSON - no position or text data");
+              }
+            } catch (e) {
+              log("JSON parse failed:", e.message);
             }
-            if (packet) await processPacket(packet, topic);
+            return;
           }
+
+          let packet;
+          try {
+            packet = MeshPacket.decode(rawBytes);
+            log("Decoded directly as MeshPacket");
+          } catch (e) {
+            try {
+              const env = ServiceEnvelope.decode(rawBytes);
+              packet = env.packet;
+              log("Decoded as ServiceEnvelope → packet extracted");
+            } catch (e2) {
+              log("Failed to decode as MeshPacket or ServiceEnvelope");
+              return;
+            }
+          }
+          if (packet) await processPacket(packet, topic);
         } catch (e) {
           log("Message handler error:", e.message);
         }
@@ -574,14 +718,17 @@ message ServiceEnvelope {
       });
     }
 
-    initMap();
-    loadConfigUI();
-    if (Object.keys(config).length > 0) {
-      connectMQTT();
-      showMap();
-    } else {
-      showConfig();
-    }
+    // Wait for DOM ready
+    document.addEventListener('DOMContentLoaded', () => {
+      initMap();
+      loadConfigUI();
+      if (Object.keys(config).length > 0) {
+        connectMQTT();
+        showMap();
+      } else {
+        showConfig();
+      }
+    });
   </script>
 </body>
 </html>
