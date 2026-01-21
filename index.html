@@ -68,7 +68,7 @@
     <label>Channel Name (e.g. LongFast, MediumFast)</label>
     <input id="channel-name" value="LongFast" />
     <label>Channel PSK (base64 - for encrypted channels)</label>
-    <input id="channel-psk" placeholder="Base64 encoded 32-byte key" />
+    <input id="channel-psk" placeholder="Base64 encoded 32-byte key" value="AQ==" />
     <label>Your Node Name</label>
     <input id="node-name" value="WebTracker" />
     <label id="precision-label">Position Precision (decimal places) – ~111 km</label>
@@ -81,8 +81,8 @@
       <option value="false" selected>No (raw protobuf)</option>
     </select>
     <div class="checkbox-label">
-      <input type="checkbox" id="verbose-logging" />
-      <label for="verbose-logging">Enable verbose logging</label>
+      <input type="checkbox" id="verbose-logging" checked />
+      <label for="verbose-logging">Enable verbose logging (recommended for debug)</label>
     </div>
     <br><br>
     <button onclick="saveConfig()">Save & Connect</button>
@@ -158,10 +158,15 @@ message ServiceEnvelope {
     const messagesDiv = document.getElementById('messages');
     const btnTrack = document.getElementById('btn-track');
 
-    let verbose = config.verboseLogging || false;
+    // Verbose is on by default now
+    let verbose = true;
 
     function log(...args) {
       if (verbose) console.log('[MeshTracker]', ...args);
+    }
+
+    function bytesToHex(bytes) {
+      return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(' ');
     }
 
     function showStatus(msg, duration = 4000) {
@@ -202,6 +207,7 @@ message ServiceEnvelope {
         );
         return new Uint8Array(decrypted);
       } catch (e) {
+        log("Decryption failed:", e.message);
         return null;
       }
     }
@@ -218,12 +224,12 @@ message ServiceEnvelope {
       document.getElementById('mqtt-pass').value = config.pass || '';
       document.getElementById('root-topic').value = config.root || 'msh/US/FL';
       document.getElementById('channel-name').value = config.channelName || 'LongFast';
-      document.getElementById('channel-psk').value = config.psk || '';
+      document.getElementById('channel-psk').value = config.psk || 'AQ==';
       document.getElementById('node-name').value = config.name || 'WebTracker';
       document.getElementById('precision').value = config.precision ?? 6;
       document.getElementById('interval').value = config.interval ?? 600;
       document.getElementById('use-json').value = config.useJson !== false ? 'true' : 'false';
-      document.getElementById('verbose-logging').checked = config.verboseLogging || false;
+      document.getElementById('verbose-logging').checked = config.verboseLogging !== false; // default true
       verbose = document.getElementById('verbose-logging').checked;
       updatePrecisionLabel(document.getElementById('precision').value);
     }
@@ -300,11 +306,8 @@ message ServiceEnvelope {
         return;
       }
 
-      // Port Saint John, FL center
       const centerLat = 28.554;
       const centerLon = -80.808;
-
-      // Random offset within ~3 km (approx 0.027 degrees)
       const offset = 0.027;
       const fakeLat = centerLat + (Math.random() * offset * 2 - offset);
       const fakeLon = centerLon + (Math.random() * offset * 2 - offset);
@@ -369,14 +372,12 @@ message ServiceEnvelope {
       const payload = Position.encode(pos).finish();
 
       if (verbose) {
-        log("Sent Position payload length:", payload.length);
-        log("Sent Position payload hex:", Array.from(payload).map(b => b.toString(16).padStart(2,'0')).join(' '));
-        log("Pre-encode values - lat_i:", latI, "lon_i:", lonI, "alt:", alt);
+        log("Sending Position - latI:", latI, "lonI:", lonI, "alt:", alt);
+        log("Position payload hex:", bytesToHex(payload));
       }
 
       await sendProtobuf(payload, 3);
       showStatus("Position sent");
-      if (verbose) log(`Sent position: lat=${lat.toFixed(6)}, lon=${lon.toFixed(6)}`);
     }
 
     async function sendText() {
@@ -387,7 +388,6 @@ message ServiceEnvelope {
       await sendProtobuf(payload, 1);
       addMessage('You', text, true);
       input.value = '';
-      if (verbose) log(`Sent text: "${text}"`);
     }
 
     async function sendProtobuf(payloadBytes, portNum) {
@@ -407,12 +407,8 @@ message ServiceEnvelope {
       const topic = `${config.root}/${channelPath}/${config.channelName}/${myNodeIdHex}`;
 
       client.publish(topic, finalBytes, {qos: 0}, (err) => {
-        if (err) {
-          log("Publish failed:", err);
-          showStatus("Failed to send message", 5000);
-        } else if (verbose) {
-          log(`Published to ${topic} (port ${portNum})`);
-        }
+        if (err) log("Publish failed:", err);
+        else if (verbose) log(`Published to ${topic} (port ${portNum})`);
       });
     }
 
@@ -426,71 +422,86 @@ message ServiceEnvelope {
 
     async function processPacket(packet, topic) {
       try {
+        log(`Received on topic: ${topic}`);
+        log(`Raw envelope/packet length: ${new Uint8Array(packet).length} bytes`);
+
         let payloadBytes;
         let fromHex = '!' + (packet.from >>> 0).toString(16).padStart(8, '0');
 
         if (packet.encrypted && packet.encrypted.length > 0) {
+          log(`Encrypted payload detected (${packet.encrypted.length} bytes)`);
           const pskB = base64ToBytes(config.psk);
-          if (!pskB || pskB.length !== 32) return;
+          if (!pskB || pskB.length !== 32) {
+            log("Skipping - invalid PSK length");
+            return;
+          }
           payloadBytes = await decryptPayload(packet.encrypted, pskB, packet.from, packet.id);
-          if (!payloadBytes) return;
-          if (verbose) log("Decrypted payload:", payloadBytes.length, "bytes");
+          if (!payloadBytes) {
+            log("Decryption failed or returned null");
+            return;
+          }
+          log(`Decrypted successfully - payload length: ${payloadBytes.length} bytes`);
+          log(`Decrypted hex: ${bytesToHex(payloadBytes)}`);
         } else if (packet.decoded && packet.decoded.payload) {
           payloadBytes = packet.decoded.payload;
-          if (verbose) log("Cleartext payload:", payloadBytes.length, "bytes");
+          log(`Cleartext payload: ${payloadBytes.length} bytes`);
+          log(`Cleartext hex: ${bytesToHex(payloadBytes)}`);
         } else {
+          log("No valid payload (encrypted or decoded)");
           return;
         }
 
         const port = packet.decoded?.portnum || 0;
+        log(`PortNum: ${port}`);
 
         if (port === 3) {
           try {
             const pos = Position.decode(payloadBytes);
-            if (verbose) {
-              console.log("Raw Position fields:", JSON.stringify(pos));
-              console.log("Decoded Position object keys:", Object.keys(pos));
-              console.log("latitudeI present?", 'latitudeI' in pos, "value:", pos.latitudeI);
-              console.log("longitudeI present?", 'longitudeI' in pos, "value:", pos.longitudeI);
-            }
+            log("Position decoded - raw fields:");
+            log(`  latitudeI: ${pos.latitudeI ?? 'missing'}`);
+            log(`  longitudeI: ${pos.longitudeI ?? 'missing'}`);
+            log(`  altitude: ${pos.altitude ?? 'missing'}`);
+            log(`  time: ${pos.time ?? 'missing'}`);
+            log(`  precision_bits: ${pos.precision_bits ?? 'missing'}`);
 
             const latRaw = pos.latitudeI ?? 0;
             const lonRaw = pos.longitudeI ?? 0;
             const lat = latRaw / 1e7;
             const lon = lonRaw / 1e7;
 
-            if (verbose) {
-              console.log("Raw latI:", latRaw, "→", lat.toFixed(8));
-              console.log("Raw lonI:", lonRaw, "→", lon.toFixed(8));
-              console.log("Altitude:", pos.altitude, "Time:", pos.time);
-            }
-
             if (latRaw === 0 && lonRaw === 0) {
-              log("Empty position received");
+              log("Empty/zero position - skipping plot");
             } else if (Math.abs(lat) > 90 || Math.abs(lon) > 180 || isNaN(lat) || isNaN(lon)) {
-              log("Invalid position received");
+              log("Invalid lat/lon values");
             } else {
-              log("Valid position:", lat.toFixed(6), lon.toFixed(6));
+              log(`Valid position: lat=${lat.toFixed(6)}, lon=${lon.toFixed(6)}`);
               updateMarker(fromHex, lat, lon, `Alt: ${pos.altitude || 'N/A'}m`, fromHex === myNodeIdHex);
             }
           } catch (e) {
             log("Position decode failed:", e.message);
-            if (verbose) log("Raw payload hex:", Array.from(payloadBytes).map(b => b.toString(16).padStart(2,'0')).join(' '));
           }
         } else if (port === 1) {
           try {
             const text = new TextDecoder().decode(payloadBytes);
+            log(`Text message: "${text}"`);
             addMessage(fromHex, text);
-            if (verbose) log("Text:", text);
-          } catch (e) {}
+          } catch (e) {
+            log("Text decode failed");
+          }
         } else if (port === 4) {
           try {
             const user = User.decode(payloadBytes);
+            log(`NodeInfo - long_name: ${user.long_name || 'N/A'}, short_name: ${user.short_name || 'N/A'}`);
             if (markers[fromHex]) markers[fromHex].bindPopup(user.long_name || fromHex);
-            if (verbose) log("NodeInfo:", user.long_name || user.short_name || fromHex);
-          } catch (e) {}
+          } catch (e) {
+            log("NodeInfo decode failed");
+          }
+        } else {
+          log(`Unhandled PortNum ${port} - ${payloadBytes.length} bytes`);
         }
-      } catch (e) {}
+      } catch (e) {
+        log("General packet processing error:", e.message);
+      }
     }
 
     function connectMQTT() {
@@ -517,36 +528,49 @@ message ServiceEnvelope {
         const subTopic = config.useJson ? `${config.root}/json/#` : `${config.root}/#`;
         client.subscribe(subTopic, err => {
           if (err) log("Subscribe failed");
-          else log("Subscribed OK");
+          else log("Subscribed to:", subTopic);
         });
       });
 
       client.on('message', async (topic, message) => {
-        const rawBytes = new Uint8Array(message);
         try {
           if (config.useJson) {
-            // JSON handling if needed later
+            log("JSON mode - raw message:", message.toString());
+            // Add JSON parsing here later if needed
           } else {
+            const rawBytes = new Uint8Array(message);
+            log(`Raw message length: ${rawBytes.length} bytes`);
+            log(`Raw hex (first 64 bytes): ${bytesToHex(rawBytes.slice(0, 64))}${rawBytes.length > 64 ? '...' : ''}`);
+
             let packet;
             try {
               packet = MeshPacket.decode(rawBytes);
+              log("Decoded directly as MeshPacket");
             } catch (e) {
               try {
                 const env = ServiceEnvelope.decode(rawBytes);
                 packet = env.packet;
-              } catch {}
+                log("Decoded as ServiceEnvelope → packet extracted");
+              } catch (e2) {
+                log("Failed to decode as MeshPacket or ServiceEnvelope");
+                return;
+              }
             }
             if (packet) await processPacket(packet, topic);
           }
-        } catch {}
+        } catch (e) {
+          log("Message handler error:", e.message);
+        }
       });
 
       client.on('error', err => {
         showStatus("MQTT error");
+        log("MQTT error:", err);
       });
 
       client.on('close', () => {
         showStatus("Disconnected");
+        log("MQTT connection closed");
       });
     }
 
