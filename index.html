@@ -65,6 +65,8 @@
     <input id="mqtt-pass" type="password" />
     <label>Root Topic</label>
     <input id="root-topic" value="msh/US/FL" />
+    <label>Channel Name (e.g. LongFast, MediumFast)</label>
+    <input id="channel-name" value="LongFast" />
     <label>Channel PSK (base64 - for encrypted channels)</label>
     <input id="channel-psk" placeholder="Base64 encoded 32-byte key" />
     <label>Your Node Name</label>
@@ -215,6 +217,7 @@ message ServiceEnvelope {
       document.getElementById('mqtt-user').value = config.user || '';
       document.getElementById('mqtt-pass').value = config.pass || '';
       document.getElementById('root-topic').value = config.root || 'msh/US/FL';
+      document.getElementById('channel-name').value = config.channelName || 'LongFast';
       document.getElementById('channel-psk').value = config.psk || '';
       document.getElementById('node-name').value = config.name || 'WebTracker';
       document.getElementById('precision').value = config.precision ?? 6;
@@ -231,6 +234,7 @@ message ServiceEnvelope {
         user: document.getElementById('mqtt-user').value.trim(),
         pass: document.getElementById('mqtt-pass').value.trim(),
         root: document.getElementById('root-topic').value.trim(),
+        channelName: document.getElementById('channel-name').value.trim() || 'LongFast',
         psk: document.getElementById('channel-psk').value.trim(),
         name: document.getElementById('node-name').value.trim() || 'WebTracker',
         precision: parseInt(document.getElementById('precision').value),
@@ -359,7 +363,7 @@ message ServiceEnvelope {
         longitudeI: lonI,
         altitude: Math.round(alt),
         time: Math.floor(Date.now() / 1000),
-        precision_bits: 32
+        precision_bits: config.precision ?? 6
       });
 
       const payload = Position.encode(pos).finish();
@@ -399,9 +403,17 @@ message ServiceEnvelope {
 
       const finalBytes = MeshPacket.encode(packet).finish();
 
-      const topic = `${config.root}/${config.useJson ? 'json/mqtt' : '2/e'}/${myNodeIdHex}`;
-      client.publish(topic, finalBytes, {qos: 0});
-      if (verbose) log(`Published to ${topic} (port ${portNum})`);
+      const channelPath = config.useJson ? 'json' : '2/e';
+      const topic = `${config.root}/${channelPath}/${config.channelName}/${myNodeIdHex}`;
+
+      client.publish(topic, finalBytes, {qos: 0}, (err) => {
+        if (err) {
+          log("Publish failed:", err);
+          showStatus("Failed to send message", 5000);
+        } else if (verbose) {
+          log(`Published to ${topic} (port ${portNum})`);
+        }
+      });
     }
 
     function addMessage(from, text, isSent = false) {
